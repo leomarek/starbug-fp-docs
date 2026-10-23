@@ -1,0 +1,154 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+
+\usepackage{cite}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc,decorations.pathreplacing}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.17}
+\usepackage[hidelinks]{hyperref}
+\usepackage{url}
+
+\definecolor{sbblue}{RGB}{31,94,160}
+\definecolor{sbred}{RGB}{190,58,48}
+
+\newcommand{\hint}{\texttt{c.li x0,\,$N$}}
+
+\begin{document}
+
+\title{Compiling C for a Hint-Based VLIW: An LLVM Back End for STARBUG on RISC-V Wally\\
+{\large Midterm Report}}
+
+\author{
+\IEEEauthorblockN{Leo Marek, Gregory Chekler\IEEEauthorrefmark{1}, Jing Jing Chen\IEEEauthorrefmark{1}, Elliot Chae\IEEEauthorrefmark{1}, Ethan Carr\IEEEauthorrefmark{1}, and Ray Simar}
+\IEEEauthorblockA{Department of Electrical and Computer Engineering, Rice University, Houston, TX, USA\\
+\{lnm7, gsc8, jc165, ejc12, ehc6, ray.simar\}@rice.edu\qquad \IEEEauthorrefmark{1}Equal contribution}
+}
+
+\maketitle
+
+\begin{abstract}
+STARBUG is a four-lane VLIW extension to the CORE-V Wally RISC-V core in which each bundle is announced by the compressed instruction \hint, an architectural no-op. The same binary therefore runs unmodified on a stock RV32C core and in parallel on STARBUG. Our earlier evaluation relied on hand-scheduled assembly, which left open whether a compiler can target the design at all. This report describes midterm progress on an LLVM back end that forms bundles automatically from ordinary C. It combines a post-register-allocation packetizer that keeps every bundle correct under both parallel and sequential execution, an I-cache-line-aware layout pass, and a static bundle verifier. In RTL simulation of five CMSIS-DSP kernels, compiled code reaches a 1.40$\times$ geometric-mean speedup over scalar code versus 1.47$\times$ for hand scheduling, recovering 95.6\% of the hand-scheduled gain. No compiled binary contains an illegal bundle, whereas four of ten hand-scheduled binaries do.
+\end{abstract}
+
+\begin{IEEEkeywords}
+RISC-V, VLIW, LLVM, instruction scheduling, DSP, CORE-V Wally
+\end{IEEEkeywords}
+
+\section{Introduction}
+Embedded DSP workloads need high instruction throughput under tight power and area budgets. Superscalar and out-of-order cores find instruction-level parallelism (ILP) dynamically, but at a hardware cost that is hard to justify in a small core. VLIW machines move scheduling to the compiler~\cite{fisher-vliw-1983}, but traditional VLIW encodings break binary compatibility, which has limited their adoption in the RISC-V ecosystem.
+
+STARBUG takes a hybrid approach. A RISC-V HINT, the 16-bit \hint{} with $1\le N\le 4$~\cite{riscv-unpriv}, tells a modified CORE-V Wally core~\cite{corev-wally,harris-socdesign-2025} that the next $N$ instructions are independent and may issue together. A standard core sees a write to \texttt{x0} and treats it as a no-op. Last semester we modeled the bundle semantics in Google's MPACT simulator, implemented four-lane issue in Wally RTL, extended the floating-point (FP) datapath to all lanes, and synthesized the design for a Xilinx VCU108 FPGA. Hand-scheduled integer kernels ran 1.24--1.51$\times$ faster than scalar code.
+
+Reviewers of that work raised one main objection: for an ISA extension whose selling point is that existing toolchains keep working, hand-scheduled kernels show the hardware's upper bound but say nothing about whether a compiler can produce valid bundles. This semester's objective is to answer that question. Our goals are to (i)~build an LLVM~\cite{lattner-llvm-2004} back end that emits STARBUG bundles from unmodified C, (ii)~measure it against hand scheduling on the same RTL, and (iii)~make bundle legality checkable, since the hardware does not check it. This report covers the architecture briefly and focuses on the compiler.
+
+\section{Methods}
+
+\subsection{STARBUG Architecture Overview}
+Fig.~\ref{fig:arch} summarizes the design. The instruction fetch unit (IFU) recognizes the hint before decompression, extracts up to four 16- or 32-bit payload instructions from the current I-cache line, and dispatches them to four lanes that share a widened integer register file (8 read / 4 write ports) and a widened FP register file. Lane~0 is a full Wally execution unit. Worker lanes~1--3 handle integer, multiply, and FP arithmetic, but their branch-redirect and load/store paths are disconnected. The single load/store unit (LSU) therefore limits each bundle to one memory operation, which must be in lane~0. The fetch unit may also \emph{decline} a bundle: if $N>4$, if the bundle crosses a 64-byte I-cache line, or if a branch lands inside it. In that case the hint retires as a no-op and the payload runs sequentially. To save area there is no interlock: an intra-bundle dependence or a worker-lane memory operation silently produces a wrong result, not a fault.
+
+\begin{figure}[t]
+\centering
+\input{figures/fig-architecture.tex}
+\caption{STARBUG bundle encoding and lane structure. The three-instruction bundle is taken from the hand-scheduled biquad kernel; its single memory operation is placed in lane~0.}
+\label{fig:arch}
+\end{figure}
+
+\subsection{Compiler Obligations}
+Because a bundle is a request that the hardware may refuse, the compiler must satisfy three obligations that a conventional VLIW compiler does not face:
+\begin{enumerate}
+\item \emph{Dual correctness.} Every bundle must be correct both as a parallel issue group and as a sequential instruction stream, since declined bundles and stock cores execute the bytes in order (Table~\ref{tab:hazards}).
+\item \emph{Lane legality without a safety net.} Memory, control-flow, CSR, and PC-relative instructions must be in lane~0, with at most one memory operation per bundle.
+\item \emph{Placement.} A bundle exists only if it fits within one I-cache line, so whether it is used depends on where the instructions end up in the final binary. Placement constraints of this kind are otherwise found only in explicitly parallel encodings such as IA-64~\cite{schlansker-epic-2000} and the TI C6x~\cite{ti-c6000}.
+\end{enumerate}
+
+\begin{table}[t]
+\centering
+\caption{Register hazards between members of one bundle}
+\label{tab:hazards}
+\footnotesize\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Hazard & Parallel issue & Sequential fallback (if reordered)\\
+\midrule
+RAW & unsafe (no same-cycle bypass) & unsafe\\
+WAW & unsafe (no defined winner) & unsafe\\
+WAR & safe (all lanes read first) & unsafe once order changes\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{LLVM Back End}
+The back end is a fork of LLVM targeting \texttt{riscv32} with \texttt{-mcpu=starbug-vliw}. Fig.~\ref{fig:compiler}(a) shows where its passes run in the code generator.
+
+\emph{Packetizer.} Bundles are formed after register allocation, because legality depends on physical registers. RAW and WAW conflicts always end a packet. WAR is the subtle case: it is harmless in parallel, but becomes illegal if the packetizer reorders instructions. We therefore accept WAR pairs only while the packet still follows the original program order. Instructions are classified by opcode and by \texttt{mayLoad}/\texttt{mayStore} flags rather than by mnemonic, and FP operations may use any lane, matching the RTL. An unrecognized instruction defaults to lane~0, which is always safe.
+
+\emph{Bundle layout pass.} This pass runs last, after compression, branch relaxation, and pseudo-instruction expansion, because byte offsets are not final until then. It tracks the emitted size of every instruction, including branches that the assembler will compress, and splits any bundle that would cross a 64-byte line into two bundles at the boundary (Fig.~\ref{fig:compiler}(b)). Splitting never moves an instruction, adds no padding, and preserves program order. Any subset of an independent set is still independent, so both halves remain legal.
+
+\emph{Unroll policy.} Spills are memory operations that compete for the single lane-0 LSU, so we cap unrolling at a factor of 8 (maximum 16), the best point in our sweep.
+
+\begin{figure}[t]
+\centering
+\resizebox{\columnwidth}{!}{\input{figures/fig-compiler.tex}}
+\caption{(a) STARBUG passes (red) in the LLVM RISC-V code generator and the checking flow (blue). (b) The layout pass splits a bundle that would cross an I-cache line; no instruction moves and no padding is added.}
+\label{fig:compiler}
+\end{figure}
+
+\subsection{Verification and Evaluation}
+\emph{Bundle verifier.} A standalone checker reconstructs every bundle from the final ELF encodings. It rejects intra-bundle RAW/WAW conflicts, illegal lane assignments, and hints with $N>4$. The checker uses the same hardware contract, read directly from the RTL, as the back end.
+
+\emph{Workloads and measurement.} We use five CMSIS-DSP~\cite{cmsis-dsp} float32 kernels (FIR, biquad, LMS, DCT-IV, real FFT) and build each one three ways: GCC \texttt{-O3} scalar (\texttt{rv32gc}), hand-scheduled assembly, and STARBUG LLVM. We report cycles in the kernel region (\texttt{mcycle}) from full-RTL Questa simulation, including caches and LSU contention. For bundle coverage and ILP, we join Spike~\cite{spike} PC histograms with the static bundle map. This is valid because the hint is a no-op on Spike. Each kernel also checks its output signal-to-noise ratio (SNR) against a golden reference.
+
+\section{Results (Partial)}
+\emph{Speedup.} Fig.~\ref{fig:speedup} compares compiled and hand-scheduled code. Compiled code reaches a 1.402$\times$ geometric mean over scalar, versus 1.465$\times$ for hand scheduling, so the compiler recovers 95.6\% of the hand-scheduled speedup with no manual annotation. On \texttt{rfft512} the compiled build is 6.9\% \emph{faster} than the hand-scheduled one. The hand-written hints cover only the code path taken by 2048-point transforms, so at 512 points the hand-scheduled hot function \texttt{arm\_radix8\_butterfly\_f32} runs entirely unbundled (0.0\% coverage, ILP 1.00). The compiler covers both paths (81.4\% coverage, ILP 2.32). The largest gap is \texttt{lms}, where the compiler reaches 85\% of the hand speedup.
+
+\begin{figure}[t]
+\centering
+\input{figures/fig-speedup.tex}
+\caption{Kernel-region speedup over the GCC \texttt{-O3} scalar build (Questa RTL, layout pass enabled). Dashed line: scalar. $^\dagger$\texttt{dct4} misses its SNR threshold in every build, including clang without the packetizer (Sec.~\ref{sec:discussion}).}
+\label{fig:speedup}
+\end{figure}
+
+\emph{Legality.} Across all twenty binaries, the verifier finds illegal bundles in 4 of 10 hand-scheduled binaries and in none of the 10 compiled ones. The defects include a branch in a worker lane on a live path in \texttt{arm\_dct4\_f32}. Because worker lanes cannot redirect the PC, the branch falls through into an unrolled body and causes a silent out-of-bounds access, which the kernel's output check happens to miss. A second defect is an intra-bundle RAW pair in \texttt{arm\_bitreversal\_16}.
+
+\emph{Effect of individual fixes.} Table~\ref{tab:ablation} isolates the main back-end fixes, measured in statically bundled instructions per kernel. The largest effect came from debug information. Each \texttt{DBG\_VALUE} ended the packet in progress, so building with \texttt{-g} removed about three quarters of all bundling. Hand-written assembly was unaffected, so this defect lowered only the compiler's numbers. The layout pass adds 1.98\% geometric-mean speedup (up to 4.4\% on biquad). Disassembly with hints removed shows that the pass changes only PC-relative immediates.
+
+\begin{table}[t]
+\centering
+\caption{Statically bundled instructions before and after each back-end fix, and speedup from the layout pass}
+\label{tab:ablation}
+\footnotesize
+\begin{tabular}{@{}llrr@{}}
+\toprule
+Fix & Kernel & Before & After\\
+\midrule
+Debug instructions ignored (\texttt{-g}) & biquad & 40 & 144\\
+FP allowed in worker lanes & biquad & 69 & 155\\
+Intra-bundle WAR accepted & cfft\_radix8 & 195 & 237\\
+Line-aware layout (speedup) & 5-kernel geomean & --- & +1.98\%\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Discussion (Partial)}
+\label{sec:discussion}
+The midterm results suggest that STARBUG can be targeted by a compiler. Automatic bundling reaches most of the hand-scheduled performance, covers code that hand scheduling missed, and is the only producer in our study whose output passes the legality check. The remaining gap has two known causes. First, bundles cannot span basic blocks. In biquad, the pointer updates that the hand-written code folds into FP bundles sit past a branch in compiled code (ILP 2.14 versus 2.61), which global scheduling~\cite{bernstein-rodeh-1991,hwu-superblock-1993} would address. Second, there is no modulo scheduling~\cite{rau-modulo-1994}. FIR and LMS are limited by the single LSU, so the best schedule pairs each load with the previous tap's multiply-add. That pairing requires software pipelining, and more unrolling does not help.
+
+Two findings concern the toolchain rather than the architecture. Linker relaxation removes bytes after the layout pass has run, which invalidates its offsets. Disabling relaxation makes the pass more effective, but costs FIR about 6\% on its own. Layout-sensitive hints therefore need support across the whole toolchain, including the linker. Also, an estimate that line-crossing bundles cost FIR 20\% of runtime proved wrong: removing most of them gained 0.34\%. Decline rates are not a performance model, so we report RTL cycles.
+
+Several threats to validity remain, and they set our plan for the rest of the semester. Correctness currently rests on per-kernel SNR checks and the static verifier. LMS and rfft pass by only 1\,dB, so we will add lockstep comparison against Spike. The scalar baseline uses GCC rather than clang, so part of the speedup may come from the different compiler; a clang scalar build will isolate the effect of bundling. \texttt{dct4\_512} misses its 118\,dB threshold in every configuration, including clang with no packetizer (110\,dB), because the threshold was calibrated against GCC's floating-point contraction. We will recalibrate it. Our FPGA area figures appear to compare integer-only and FP-enabled STARBUG rather than stock Wally, so we will re-synthesize against an unmodified \texttt{rv32gc} configuration. Finally, the workload set is narrow. We will extend the evaluation to 13 integer and control-heavy kernels and to the five benchmark variants not yet measured with the layout pass, and we will replace the static branch-size guess in the layout pass with an iterative branch-distance model.
+
+\section*{Acknowledgements}
+We thank David Harris, James Stine, and the OpenHW Group for the open-source CORE-V Wally core, the developers of Google MPACT and Spike, and Rice University ECE for support. Generative AI tools were used to help write code, debug, and draft and edit this report. The authors reviewed all such content and take full responsibility for it.
+
+\section*{CRediT Author Statement}
+Roles follow the CRediT taxonomy~\cite{credit}. \textbf{Leo Marek:} Conceptualization, Methodology, Software (LLVM back end, verifier), Validation, Formal Analysis, Investigation, Visualization, Writing -- Original Draft, Writing -- Review \& Editing. \textbf{Gregory Chekler, Jing Jing Chen, Elliot Chae, Ethan Carr:} Methodology, Validation, Investigation, Writing -- Review \& Editing. \textbf{Ray Simar:} Conceptualization, Supervision, Resources.
+
+\bibliographystyle{IEEEtran}
+\bibliography{references}
+
+\end{document}

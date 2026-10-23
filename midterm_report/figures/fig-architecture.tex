@@ -1,0 +1,41 @@
+% Fig. 1 -- STARBUG bundle encoding and lane structure (drawn to fit one IEEE column, 88 mm).
+\begin{tikzpicture}[
+  x=1mm, y=1mm,
+  font=\scriptsize,
+  >=Stealth,
+  word/.style={draw, minimum height=4.6mm, inner sep=0pt, font=\ttfamily\tiny, anchor=west},
+  lane/.style={draw, rounded corners=1.5pt, minimum height=10mm, minimum width=19.5mm, align=center, inner sep=1pt},
+  rf/.style={draw, rounded corners=1.5pt, fill=black!6, minimum height=5mm, minimum width=41mm, align=center, inner sep=1pt, font=\tiny},
+]
+% ---- fetch line (x = 0..84) -------------------------------------------
+\node[word, fill=black!4,  minimum width=5mm]  (pre)  at (0,0)  {$\cdots$};
+\node[word, fill=sbred!22, minimum width=13mm] (h)    at (5,0)  {c.li x0,3};
+\node[word, fill=sbblue!15,minimum width=20mm] (p0)   at (18,0) {flw fa3,0(a1)};
+\node[word, fill=sbblue!15,minimum width=19mm] (p1)   at (38,0) {addi a5,a2,4};
+\node[word, fill=sbblue!15,minimum width=19mm] (p2)   at (57,0) {addi a1,a1,4};
+\node[word, fill=black!4,  minimum width=8mm]  (rest) at (76,0) {$\cdots$};
+\draw[decorate, decoration={brace, amplitude=2.5pt}] (0,2.8) -- (84,2.8)
+  node[midway, above=2.5pt, font=\tiny] {one 64-byte I-cache line: the hint and all $N$ members must fit inside it};
+\node[font=\tiny, text=sbred]  at (11.5,-3.9) {hint (16 b)};
+\node[font=\tiny, text=sbblue] at (47,-3.9) {$N=3$ independent members (16 or 32 b each)};
+
+% ---- lanes ------------------------------------------------------------
+\node[lane, fill=sbblue!10] (l0) at (9.75,-15)  {\textbf{Lane 0}\\[-1pt]ALU, MDU, FPU,\\[-1pt]LSU, branch, CSR};
+\node[lane]                 (l1) at (31.25,-15) {\textbf{Lane 1}\\[-1pt]ALU, MDU, FPU};
+\node[lane]                 (l2) at (52.75,-15) {\textbf{Lane 2}\\[-1pt]ALU, MDU, FPU};
+\node[lane, draw=black!40, text=black!50] (l3) at (74.25,-15) {\textbf{Lane 3}\\[-1pt](idle)};
+\draw[->, sbblue, thick] (p0.south) ++(0,-3.2) -- (l0.north);
+\draw[->, sbblue, thick] (p1.south) ++(0,-3.2) -- (l1.north);
+\draw[->, sbblue, thick] (p2.south) ++(0,-3.2) -- (l2.north);
+
+% ---- register files ---------------------------------------------------
+\node[rf] (irf) at (20.5,-26.5) {shared integer RF (8 read / 4 write ports)};
+\node[rf] (frf) at (63.5,-26.5) {shared FP RF (3 read / 1 write port per lane)};
+\foreach \l in {l0,l1,l2,l3} { \draw[<->, black!45] (\l.south) -- ++(0,-1.9); }
+
+% ---- behaviour note ---------------------------------------------------
+\node[draw, dashed, rounded corners=1.5pt, align=left, text width=81mm, inner sep=1.5mm,
+      anchor=north west, font=\tiny] at (0,-30.5)
+  {\textbf{Stock RV32C core:} \texttt{c.li x0,N} writes \texttt{x0}, so it is a NOP and the same bytes run in order.\\
+   \textbf{STARBUG:} if $1\le N\le 4$ and the bundle fits in the line, all members issue in one cycle; otherwise the hint is a NOP.};
+\end{tikzpicture}

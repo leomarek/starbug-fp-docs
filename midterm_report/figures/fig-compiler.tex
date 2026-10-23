@@ -1,0 +1,55 @@
+% Fig. 2 -- (a) STARBUG passes in the LLVM RISC-V code generator,
+%          (b) the I-cache-line layout pass splitting a straddling bundle.
+% Drawn to fit one IEEE column (88 mm).
+\begin{tikzpicture}[
+  x=1mm, y=1mm,
+  font=\tiny,
+  >=Stealth,
+  stage/.style={draw, rounded corners=1.5pt, minimum height=7mm, align=center, inner sep=1pt, fill=black!4},
+  new/.style={stage, fill=sbred!18, draw=sbred, thick},
+  tool/.style={stage, fill=sbblue!12, draw=sbblue},
+  word/.style={draw, minimum height=4.2mm, inner sep=0pt, font=\ttfamily\tiny, anchor=west},
+]
+% ---- (a) row 1 ---------------------------------------------------------
+\node[font=\bfseries\scriptsize, anchor=west] at (-1,6.5) {(a)};
+\node[stage, minimum width=15.5mm] (c)  at (7.75,0)  {C source\\(CMSIS-DSP)};
+\node[stage, minimum width=15.5mm] (ir) at (25.75,0) {Clang\\$\to$ LLVM IR};
+\node[new,   minimum width=15.5mm] (un) at (43.75,0) {unroll\\policy};
+\node[stage, minimum width=15.5mm] (ra) at (61.75,0) {register\\allocation};
+\node[new,   minimum width=15.5mm] (pk) at (79.75,0) {VLIW\\packetizer};
+\draw[->] (c) -- (ir); \draw[->] (ir) -- (un); \draw[->] (un) -- (ra); \draw[->] (ra) -- (pk);
+% ---- (a) row 2 (right to left) ---------------------------------------
+\node[stage, minimum width=26mm] (late) at (75,-11)  {compress, branch relax,\\expand pseudos};
+\node[new,   minimum width=15mm] (lay)  at (50.5,-11) {bundle\\layout};
+\node[stage, minimum width=17mm] (asm)  at (30.5,-11) {AsmPrinter\\\texttt{c.li zero,N}};
+\node[tool,  minimum width=15.5mm] (ver) at (7.75,-11) {bundle\\verifier};
+\draw[->] (pk.south) -- (pk.south |- late.north);
+\draw[->] (late) -- (lay); \draw[->] (lay) -- (asm); \draw[->] (asm) -- (ver);
+% ---- (a) row 3 ---------------------------------------------------------
+\node[tool, minimum width=15.5mm] (sim) at (7.75,-22)  {Questa RTL\\(\texttt{mcycle})};
+\node[tool, minimum width=15.5mm] (spk) at (25.75,-22) {Spike PC\\histogram};
+\draw[->] (ver) -- (sim); \draw[->] (ver.south east) -- (spk.north);
+\node[new,  minimum width=4mm, minimum height=2.6mm] (k1) at (39,-19.5) {};
+\node[anchor=west] at (41.5,-19.5) {new STARBUG pass};
+\node[tool, minimum width=4mm, minimum height=2.6mm] (k2) at (39,-24.5) {};
+\node[anchor=west] at (41.5,-24.5) {checking and measurement};
+
+% ---- (b) layout split --------------------------------------------------
+\node[font=\bfseries\scriptsize, anchor=west] at (-1,-30) {(b)};
+\node[anchor=east, font=\scriptsize] at (13,-31) {before};
+\node[anchor=west, align=left, text width=17mm] at (71,-31) {declined: all four run scalar};
+\node[word, fill=sbred!22,  minimum width=8mm]  at (14,-31) {c.li 4};
+\node[word, fill=sbblue!15, minimum width=12mm] at (22,-31) {op1};
+\node[word, fill=sbblue!15, minimum width=12mm] at (34,-31) {op2};
+\node[word, fill=sbblue!15, minimum width=12mm] at (46,-31) {op3};
+\node[word, fill=sbblue!15, minimum width=12mm] at (58,-31) {op4};
+\node[anchor=east, font=\scriptsize] at (13,-37) {after};
+\node[anchor=west, align=left, text width=8mm, inner sep=0.5pt] at (79,-37) {two legal bundles};
+\node[word, fill=sbred!22,  minimum width=8mm]  at (14,-37) {c.li 2};
+\node[word, fill=sbblue!15, minimum width=12mm] at (22,-37) {op1};
+\node[word, fill=sbblue!15, minimum width=12mm] at (34,-37) {op2};
+\node[word, fill=sbred!22,  minimum width=8mm]  at (46,-37) {c.li 2};
+\node[word, fill=sbblue!15, minimum width=12mm] at (54,-37) {op3};
+\node[word, fill=sbblue!15, minimum width=12mm] at (66,-37) {op4};
+\draw[dashed, thick, black!75] (46,-28.3) -- (46,-40) node[below, font=\tiny] {64-byte line boundary};
+\end{tikzpicture}
